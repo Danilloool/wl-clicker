@@ -1,9 +1,10 @@
-#include "./build/wlr-virtual-pointer.h"
+#include "wlr-virtual-pointer.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <getopt.h>
 #include <linux/input.h>
 #include <linux/prctl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,6 +12,10 @@
 #include <sys/prctl.h>
 #include <time.h>
 #include <unistd.h>
+
+static volatile int running = 1;
+
+void int_handler(int sig) { running = 0; }
 
 struct ClientState {
     struct wl_display*                      display;
@@ -31,15 +36,16 @@ static int get_keyboard_input(int fd) {
     }
 
     if (n == sizeof(ev) && ev.type == EV_KEY && ev.code == KEY_F8)
-        return ev.value; // 1 for press, 0 for release
+        return ev.value;
 
     return -1;
 }
 
 static const char* get_keyboard_device() {
     FILE*       fp = fopen("/proc/bus/input/devices", "r");
-    static char device_file[20];
-    char        line[256];
+    static char device_file[256];
+    char        line[512];
+    bool        check = true; // checking for keyboard
 
     if (!fp) {
         perror("Error opening /proc/bus/input/devices");
@@ -47,7 +53,14 @@ static const char* get_keyboard_device() {
     }
 
     while (fgets(line, sizeof(line), fp)) {
-        if (strstr(line, "sysrq")) {
+        if (check && strstr(line, "Glorious Model O"))
+            check = false;
+
+        // move to the next device
+        if (!check && line[0] == '\n')
+            check = true;
+
+        if (check && strstr(line, "sysrq")) {
             snprintf(device_file, sizeof(device_file), "/dev/input/%s", strstr(line, "event"));
             device_file[strcspn(device_file, " ")] = '\0';
             fclose(fp);
@@ -119,13 +132,12 @@ static const struct option long_options[] = {{"toggle", no_argument, NULL, 't'},
 static const char usage[] =
     "Usage: wl-clicker [clicks-per-second] [options]\n"
     "\n"
-    "  -b  --button <0|1|2>    Specify which mouse button to click\n"
-    "                          (0 for left, 1 for right, 2 for middle)\n"
+    "  -b  --button <0|1|2>    Specify which mouse button to click (0 for left, 1 for right, 2 for "
+    "middle)\n"
     "  -t, --toggle            Toggle the autoclicker on keypress\n"
+    "  -n, --nosleep           Disables sleeping in the main loop to click as fast as possible. "
+    "Note this will increase CPU usage massively.\n"
     "  -h, --help              Show this menu\n"
-    "  -n, --nosleep           Disables sleeping in the main loop\n"
-    "                          to click as fast as possible.\n"
-    "                          Note this will increase CPU usage massively.\n"
     "\n";
 
 int main(int argc, char* argv[]) {
@@ -218,9 +230,11 @@ int main(int argc, char* argv[]) {
         sleep_time.tv_nsec = 1000000;
     }
 
+    signal(SIGINT, int_handler);
+
     printf("Ready\n");
 
-    while (1) {
+    while (running) {
         int key_state = get_keyboard_input(kbd_fd);
 
         if (key_state != -1) {
@@ -245,6 +259,8 @@ int main(int argc, char* argv[]) {
         if (!no_sleep)
             nanosleep(&sleep_time, NULL);
     }
+
+    printf(" Exiting...\n");
 
     close(kbd_fd);
     zwlr_virtual_pointer_v1_destroy(state.virtual_pointer);

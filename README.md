@@ -9,7 +9,7 @@ It works with compositors that support the [wlr-virtual-pointer](https://wayland
 Ensure the dependencies are installed:
 
 ```sh
-sudo pacman -S wayland linux-api-headers wlr-protocols
+sudo pacman -S wayland linux-api-headers
 ```
 
 Compile with `make`.
