@@ -13,6 +13,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#define NUM(a) (sizeof(a) / sizeof(*a))
+
 static volatile int running = 1;
 
 void int_handler(int sig) { running = 0; }
@@ -41,36 +43,44 @@ static int get_keyboard_input(int fd) {
     return -1;
 }
 
-static const char* get_keyboard_device() {
-    FILE*       fp = fopen("/proc/bus/input/devices", "r");
-    static char device_file[256];
-    char        line[512];
-    bool        check = true; // checking for keyboard
+#define MAX_KEYBOARDS 10 // surely
+
+static char** get_keyboard_devices() {
+    FILE*        fp = fopen("/proc/bus/input/devices", "r");
+    static char* device_paths[MAX_KEYBOARDS];
+    static char  device_storage[MAX_KEYBOARDS][256];
+    char         line[256];
+    char         event_name[32];
+    int          keyboard_count = 0;
+    bool         in_keyboard_block;
 
     if (!fp) {
         perror("Error opening /proc/bus/input/devices");
         return NULL;
     }
 
-    while (fgets(line, sizeof(line), fp)) {
-        if (check && strstr(line, "Glorious Model O"))
-            check = false;
+    for (int i = 0; i <= MAX_KEYBOARDS; i++)
+        device_paths[i] = NULL;
 
-        // move to the next device
-        if (!check && line[0] == '\n')
-            check = true;
+    while (fgets(line, sizeof(line), fp) && keyboard_count < MAX_KEYBOARDS) {
+        if (strstr(line, "Handlers=")) {
+            in_keyboard_block = strstr(line, "kbd") != NULL && strstr(line, "sysrq") != NULL;
+            if (in_keyboard_block) {
+                char* event_start = strstr(line, "event");
+                if (event_start) {
+                    sscanf(event_start, "%31s", event_name);
+                    snprintf(device_storage[keyboard_count], 256, "/dev/input/%s", event_name);
+                    device_paths[keyboard_count] = device_storage[keyboard_count];
+                    printf("Found keyboard: %s\n", device_paths[keyboard_count]);
 
-        if (check && strstr(line, "sysrq")) {
-            snprintf(device_file, sizeof(device_file), "/dev/input/%s", strstr(line, "event"));
-            device_file[strcspn(device_file, " ")] = '\0';
-            fclose(fp);
-            printf("Found keyboard device: %s\n", device_file);
-            return device_file;
+                    keyboard_count++;
+                }
+            }
         }
     }
 
     fclose(fp);
-    return NULL;
+    return keyboard_count > 0 ? device_paths : NULL;
 }
 
 static void registry_global(void* data, struct wl_registry* registry, uint32_t name,
@@ -185,12 +195,6 @@ int main(int argc, char* argv[]) {
 
     state.click_interval_ns = (1e9 / clicks_per_second) - 10000 /* ??? */;
 
-    const char* KBD_DEVICE = get_keyboard_device();
-    if (!KBD_DEVICE) {
-        fprintf(stderr, "Error: failed to find keyboard device.\n");
-        return 1;
-    }
-
     state.display = wl_display_connect(NULL);
     if (!state.display) {
         fprintf(stderr, "Error: failed to connect to Wayland display.\n");
@@ -209,14 +213,29 @@ int main(int argc, char* argv[]) {
     state.virtual_pointer =
         zwlr_virtual_pointer_manager_v1_create_virtual_pointer(state.pointer_manager, NULL);
 
-    int kbd_fd = open(KBD_DEVICE, O_RDONLY);
-    if (kbd_fd == -1) {
-        perror("Error: failed to open keyboard device");
+    char** kbd_devices = get_keyboard_devices();
+    if (!kbd_devices) {
+        fprintf(stderr, "Error: failed to find any keyboard devices.\n");
         return 1;
     }
 
-    int flags = fcntl(kbd_fd, F_GETFL, 0);
-    fcntl(kbd_fd, F_SETFL, flags | O_NONBLOCK);
+    // iterate through keyboards
+    int fds[MAX_KEYBOARDS];
+    int size = 0;
+
+    for (int i = 0; i < NUM(kbd_devices) + 1; i++) {
+        char* device = kbd_devices[i];
+        int   kbd_fd = open(device, O_RDONLY);
+        if (kbd_fd == -1) {
+            fprintf(stderr, "Error: failed to open keyboard device %s\n", device);
+            return 1;
+        }
+
+        int flags = fcntl(kbd_fd, F_GETFL, 0);
+        fcntl(kbd_fd, F_SETFL, flags | O_NONBLOCK);
+
+        fds[size++] = kbd_fd;
+    }
 
     struct timespec sleep_time;
     struct timespec last_click_time = {0, 0};
@@ -235,13 +254,15 @@ int main(int argc, char* argv[]) {
     printf("Ready\n");
 
     while (running) {
-        int key_state = get_keyboard_input(kbd_fd);
+        for (int i = 0; i < size; i++) {
+            int key_state = get_keyboard_input(fds[i]);
 
-        if (key_state != -1) {
-            if (toggle_click && key_state == 1)
-                state.key_pressed = !state.key_pressed;
-            else if (!toggle_click)
-                state.key_pressed = key_state;
+            if (key_state != -1) {
+                if (toggle_click && key_state == 1)
+                    state.key_pressed = !state.key_pressed;
+                else if (!toggle_click)
+                    state.key_pressed = key_state;
+            }
         }
 
         clock_gettime(CLOCK_MONOTONIC, &current_time);
@@ -262,7 +283,6 @@ int main(int argc, char* argv[]) {
 
     printf(" Exiting...\n");
 
-    close(kbd_fd);
     zwlr_virtual_pointer_v1_destroy(state.virtual_pointer);
     zwlr_virtual_pointer_manager_v1_destroy(state.pointer_manager);
     wl_registry_destroy(state.registry);
