@@ -28,6 +28,8 @@ struct ClientState {
     bool                                    key_pressed;
 };
 
+static inline int min(int a, int b) { return a < b ? a : b; }
+
 static int get_keyboard_input(int fd) {
     struct input_event ev;
     ssize_t            n = read(fd, &ev, sizeof(ev));
@@ -136,8 +138,7 @@ static void send_click(struct ClientState* state, int button) {
 static const struct option long_options[] = {{"toggle", no_argument, NULL, 't'},
                                              {"help", no_argument, NULL, 'h'},
                                              {"button", required_argument, NULL, 'b'},
-                                             {"nosleep", no_argument, NULL, 'n'},
-                                             {0, 0, 0, 0}};
+                                             {0, 0, 0}};
 
 static const char usage[] =
     "Usage: wl-clicker [clicks-per-second] [options]\n"
@@ -145,8 +146,6 @@ static const char usage[] =
     "  -b  --button <0|1|2>    Specify which mouse button to click (0 for left, 1 for right, 2 for "
     "middle)\n"
     "  -t, --toggle            Toggle the autoclicker on keypress\n"
-    "  -n, --nosleep           Disables sleeping in the main loop to click as fast as possible. "
-    "Note this will increase CPU usage massively.\n"
     "  -h, --help              Show this menu\n"
     "\n";
 
@@ -154,12 +153,11 @@ int main(int argc, char* argv[]) {
     unsigned int clicks_per_second = 1;
     int          button_type = 0;
     bool         toggle_click = false;
-    bool         no_sleep = false;
 
     int c;
     while (1) {
         int option_index = 0;
-        c = getopt_long(argc, argv, "thnb:", long_options, &option_index);
+        c = getopt_long(argc, argv, "thb:", long_options, &option_index);
         if (c == -1)
             break;
         switch (c) {
@@ -172,9 +170,6 @@ int main(int argc, char* argv[]) {
             break;
         case 'b': // button
             button_type = atoi(optarg);
-            break;
-        case 'n': // nosleep
-            no_sleep = true;
             break;
         default:
             fprintf(stderr, "%s", usage);
@@ -241,13 +236,8 @@ int main(int argc, char* argv[]) {
     struct timespec last_click_time = {0, 0};
     struct timespec current_time;
 
-    if (state.click_interval_ns <= 1000000) {
-        sleep_time.tv_sec = 0;
-        sleep_time.tv_nsec = state.click_interval_ns;
-    } else {
-        sleep_time.tv_sec = 0;
-        sleep_time.tv_nsec = 1000000;
-    }
+    sleep_time.tv_sec = 0;
+    sleep_time.tv_nsec = min(state.click_interval_ns, 1000000);
 
     signal(SIGINT, int_handler);
 
@@ -277,8 +267,7 @@ int main(int argc, char* argv[]) {
             }
         }
 
-        if (!no_sleep)
-            nanosleep(&sleep_time, NULL);
+        nanosleep(&sleep_time, NULL);
     }
 
     printf(" Exiting...\n");
