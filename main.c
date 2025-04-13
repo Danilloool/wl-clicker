@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #define NUM(a) (sizeof(a) / sizeof(*a))
+#define MAX_KEYBOARDS 10 // surely
 
 static volatile int running = 1;
 
@@ -26,9 +27,9 @@ struct ClientState {
     struct zwlr_virtual_pointer_v1*         virtual_pointer;
     int                                     click_interval_ns;
     bool                                    key_pressed;
+    int                                     kbd_fds[MAX_KEYBOARDS];
+    int                                     kbd_amt;
 };
-
-static inline int min(int a, int b) { return a < b ? a : b; }
 
 static int get_keyboard_input(int fd) {
     struct input_event ev;
@@ -39,13 +40,8 @@ static int get_keyboard_input(int fd) {
         return -1;
     }
 
-    if (n == sizeof(ev) && ev.type == EV_KEY && ev.code == KEY_F8)
-        return ev.value;
-
-    return -1;
+    return n == sizeof(ev) && ev.type == EV_KEY && ev.code == KEY_F8 ? ev.value : -1;
 }
-
-#define MAX_KEYBOARDS 10 // surely
 
 static char** get_keyboard_devices() {
     FILE*        fp = fopen("/proc/bus/input/devices", "r");
@@ -135,6 +131,70 @@ static void send_click(struct ClientState* state, int button) {
     wl_display_flush(state->display);
 }
 
+static bool init(struct ClientState* state, unsigned int cps) {
+    state->click_interval_ns = (1e9 / cps) - 10000;
+
+    state->display = wl_display_connect(NULL);
+    if (!state->display) {
+        fprintf(stderr, "Error: failed to connect to Wayland display.\n");
+        return false;
+    }
+
+    state->registry = wl_display_get_registry(state->display);
+    wl_registry_add_listener(state->registry, &registry_listener, state);
+    wl_display_roundtrip(state->display);
+
+    if (!state->pointer_manager) {
+        fprintf(stderr, "Error: your compositor does not support wlr-virtual-pointer.\n");
+        return false;
+    }
+
+    state->virtual_pointer =
+        zwlr_virtual_pointer_manager_v1_create_virtual_pointer(state->pointer_manager, NULL);
+
+    char** kbd_devices = get_keyboard_devices();
+    if (!kbd_devices) {
+        fprintf(stderr, "Error: failed to find any keyboard devices.\n");
+        return false;
+    }
+
+    state->kbd_amt = NUM(kbd_devices) + 1;
+
+    // iterate through keyboards
+    for (int i = 0; i < state->kbd_amt; i++) {
+        char* device = kbd_devices[i];
+        int   kbd_fd = open(device, O_RDONLY);
+        if (kbd_fd == -1) {
+            fprintf(stderr, "Error: failed to open keyboard device %s\n", device);
+            return false;
+        }
+
+        int flags = fcntl(kbd_fd, F_GETFL, 0);
+        fcntl(kbd_fd, F_SETFL, flags | O_NONBLOCK);
+
+        state->kbd_fds[i] = kbd_fd;
+    }
+
+    return true;
+}
+
+static void finish(struct ClientState* state) {
+    printf(" Exiting...\n");
+
+    for (int i = 0; i < state->kbd_amt; i++) {
+        int fd = state->kbd_fds[i];
+        if (fd >= 0) {
+            close(fd);
+            fd = -1;
+        }
+    }
+
+    zwlr_virtual_pointer_v1_destroy(state->virtual_pointer);
+    zwlr_virtual_pointer_manager_v1_destroy(state->pointer_manager);
+    wl_registry_destroy(state->registry);
+    wl_display_disconnect(state->display);
+}
+
 static const struct option long_options[] = {{"toggle", no_argument, NULL, 't'},
                                              {"help", no_argument, NULL, 'h'},
                                              {"button", required_argument, NULL, 'b'},
@@ -150,11 +210,11 @@ static const char usage[] =
     "\n";
 
 int main(int argc, char* argv[]) {
-    unsigned int clicks_per_second = 1;
+    unsigned int clicks_per_second = 20;
     int          button_type = 0;
     bool         toggle_click = false;
+    int          c;
 
-    int c;
     while (1) {
         int option_index = 0;
         c = getopt_long(argc, argv, "thb:", long_options, &option_index);
@@ -188,64 +248,23 @@ int main(int argc, char* argv[]) {
 
     struct ClientState state = {0};
 
-    state.click_interval_ns = (1e9 / clicks_per_second) - 10000 /* ??? */;
-
-    state.display = wl_display_connect(NULL);
-    if (!state.display) {
-        fprintf(stderr, "Error: failed to connect to Wayland display.\n");
+    if (!init(&state, clicks_per_second))
         return 1;
-    }
-
-    state.registry = wl_display_get_registry(state.display);
-    wl_registry_add_listener(state.registry, &registry_listener, &state);
-    wl_display_roundtrip(state.display);
-
-    if (!state.pointer_manager) {
-        fprintf(stderr, "Error: your compositor does not support wlr-virtual-pointer.\n");
-        return 1;
-    }
-
-    state.virtual_pointer =
-        zwlr_virtual_pointer_manager_v1_create_virtual_pointer(state.pointer_manager, NULL);
-
-    char** kbd_devices = get_keyboard_devices();
-    if (!kbd_devices) {
-        fprintf(stderr, "Error: failed to find any keyboard devices.\n");
-        return 1;
-    }
-
-    // iterate through keyboards
-    int fds[MAX_KEYBOARDS];
-    int size = 0;
-
-    for (int i = 0; i < NUM(kbd_devices) + 1; i++) {
-        char* device = kbd_devices[i];
-        int   kbd_fd = open(device, O_RDONLY);
-        if (kbd_fd == -1) {
-            fprintf(stderr, "Error: failed to open keyboard device %s\n", device);
-            return 1;
-        }
-
-        int flags = fcntl(kbd_fd, F_GETFL, 0);
-        fcntl(kbd_fd, F_SETFL, flags | O_NONBLOCK);
-
-        fds[size++] = kbd_fd;
-    }
 
     struct timespec sleep_time;
     struct timespec last_click_time = {0, 0};
     struct timespec current_time;
 
     sleep_time.tv_sec = 0;
-    sleep_time.tv_nsec = min(state.click_interval_ns, 1000000);
+    sleep_time.tv_nsec = state.click_interval_ns < 1000000 ? state.click_interval_ns : 1000000;
 
     signal(SIGINT, int_handler);
 
     printf("Ready\n");
 
     while (running) {
-        for (int i = 0; i < size; i++) {
-            int key_state = get_keyboard_input(fds[i]);
+        for (int i = 0; i < state.kbd_amt; i++) {
+            int key_state = get_keyboard_input(state.kbd_fds[i]);
 
             if (key_state != -1) {
                 if (toggle_click && key_state == 1)
@@ -270,12 +289,7 @@ int main(int argc, char* argv[]) {
         nanosleep(&sleep_time, NULL);
     }
 
-    printf(" Exiting...\n");
-
-    zwlr_virtual_pointer_v1_destroy(state.virtual_pointer);
-    zwlr_virtual_pointer_manager_v1_destroy(state.pointer_manager);
-    wl_registry_destroy(state.registry);
-    wl_display_disconnect(state.display);
+    finish(&state);
 
     return 0;
 }
