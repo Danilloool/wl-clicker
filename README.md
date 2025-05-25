@@ -26,6 +26,8 @@ If `input` isn't listed, add your user to it:
 sudo usermod -aG input [user]
 ```
 
+Then start a new shell in your terminal emulator to reload assigned groups.
+
 ## Usage
 
 ```sh
